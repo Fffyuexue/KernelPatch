@@ -20,6 +20,18 @@
 #include <kputils.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
+#include <linux/uaccess.h>
+#include <linux/mm.h>
+
+// 辅助函数：安全读取内核内存
+static int safe_read_kernel(void *dst, const void *src, size_t size)
+{
+    void *p = memdup_user(src, size);
+    if (IS_ERR(p)) return -1;
+    memcpy(dst, p, size);
+    kfree(p);
+    return 0;
+}
 
 uintptr_t *sys_call_table = 0;
 KP_EXPORT_SYMBOL(sys_call_table);
@@ -295,12 +307,6 @@ void fp_unwrap_syscalln(int nr, int is_compat, void *before, void *after)
 }
 KP_EXPORT_SYMBOL(fp_unwrap_syscalln);
 
-/*
-sys_xxx.cfi_jt
-
-hint #0x22  # bti c
-b #0xfffffffffeb452f4
-*/
 hook_err_t inline_wrap_syscalln(int nr, int narg, int is_compat, void *before, void *after, void *udata)
 {
     uintptr_t addr = syscalln_name_addr(nr, is_compat);
@@ -378,6 +384,75 @@ void syscall_init()
         }
     }
 
+    // -----------------------------------------------------------
+    // FIX START: 尝试通过扫描 rodata 段手动查找 sys_call_table
+    // 如果 kallsyms 查找失败，这能避免回退到较慢的 inline hook
+    // 从而解决 "Detected delayed syscall" 问题
+    // -----------------------------------------------------------
+    if (!sys_call_table) {
+        uintptr_t start_rodata = kallsyms_lookup_name("__start_rodata");
+        uintptr_t end_rodata = kallsyms_lookup_name("__end_rodata");
+        
+        // 我们选择一个在系统调用表中存在的函数地址作为锚点，例如 __arm64_sys_openat (syscall 56)
+        // 使用 syscalln_name_addr 获取地址，因为它包含了缓存逻辑和符号查找
+        uintptr_t target_func_addr = syscalln_name_addr(56, 0); // 56 is __arm64_sys_openat
+        
+        if (start_rodata && end_rodata && target_func_addr) {
+            log_boot("sys_call_table not found by kallsyms, scanning rodata...\n");
+            
+            // 扫描 rodata 段寻找指向目标函数的指针
+            for (uintptr_t addr = start_rodata; addr < end_rodata; addr += sizeof(uintptr_t)) {
+                uintptr_t val = 0;
+                // 使用安全读取避免访问非法内存导致崩溃
+                if (safe_read_kernel(&val, (const void *)addr, sizeof(uintptr_t)) != 0) {
+                    continue;
+                }
+
+                if (val == target_func_addr) {
+                    // 找到匹配项，进一步验证是否是 sys_call_table
+                    // 检查附近的表项是否指向有效的 syscall 函数
+                    // openat 是 56，我们检查 55 (fstatat/newfstatat) 或 57 (fchmod)
+                    
+                    int valid_table = 1;
+                    // 简单验证：检查索引 56 (当前找到的) 和 55
+                    // 这里的 offset 是 -1 * sizeof(uintptr_t)
+                    uintptr_t neighbor_val = 0;
+                    if (addr >= start_rodata + sizeof(uintptr_t)) {
+                        if (safe_read_kernel(&neighbor_val, (const void *)(addr - sizeof(uintptr_t)), sizeof(uintptr_t)) == 0) {
+                             // 获取 sys_newfstatat 的地址进行比对
+                             uintptr_t check_func_addr = syscalln_name_addr(55, 0);
+                             if (check_func_addr && neighbor_val == check_func_addr) {
+                                 // 验证通过，这很可能是 sys_call_table
+                                 log_boot("sys_call_table candidate found at %llx (validated)\n", addr - 1 * sizeof(uintptr_t));
+                                 sys_call_table = (typeof(sys_call_table))(addr - 1 * sizeof(uintptr_t));
+                                 break;
+                             }
+                        }
+                    }
+                    
+                    if (!valid_table && addr + sizeof(uintptr_t) < end_rodata) {
+                        // 检查索引 57
+                         if (safe_read_kernel(&neighbor_val, (const void *)(addr + sizeof(uintptr_t)), sizeof(uintptr_t)) == 0) {
+                             uintptr_t check_func_addr = syscalln_name_addr(57, 0); // __arm64_sys_fchmod
+                             if (check_func_addr && neighbor_val == check_func_addr) {
+                                 log_boot("sys_call_table candidate found at %llx (validated)\n", addr - 1 * sizeof(uintptr_t));
+                                 sys_call_table = (typeof(sys_call_table))(addr - 1 * sizeof(uintptr_t));
+                                 break;
+                             }
+                         }
+                    }
+                    
+                    // 如果无法完美验证邻居，但地址本身在 rodata 且指向有效代码，也可以尝试使用
+                    // 但为了稳定性，最好依赖验证。
+                }
+            }
+            log_boot("sys_call_table scan result: %llx\n", sys_call_table);
+        }
+    }
+    // FIX END
+    // -----------------------------------------------------------
+
     log_boot("syscall config_compat: %d\n", has_config_compat);
     log_boot("syscall has_wrapper: %d\n", has_syscall_wrapper);
 }
+
